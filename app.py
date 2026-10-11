@@ -1,9 +1,10 @@
 """
-Watch a minesweeper board on the screen while you play.
+Watch a minesweeper board on the screen and play the certain moves.
 
-Nothing here opens Chrome or attaches to the page. You open the game yourself,
-draw a box around the cells, and click the board. After each move the tool
-reads the pixels again and marks only the next cells that are certain.
+Nothing here opens Chrome or attaches to the page. You open the game yourself
+and draw a box around the cells. After each change the tool reads the pixels,
+flags the red cells, clicks a number that already has enough flags so the game
+opens around it, then opens the green cells.
 
     python screen_solver.py
     python screen_solver.py --difficulty expert
@@ -31,13 +32,51 @@ DIFFICULTIES = {
 
 
 def enable_dpi():
+    """Use real pixels on every monitor, so screenshot, overlay and clicks agree.
+
+    This must run before pyautogui is imported: pyautogui switches the process to
+    the older system-wide mode, and after that Windows refuses any change. On a
+    second monitor with another scale the clicks then land off the cells.
+    """
+    try:
+        # Per-monitor v2.
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
     except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+enable_dpi()
+
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
+
+
+def virtual_screen() -> tuple[int, int, int, int]:
+    """Left, top, width and height of the area covering every monitor."""
+    metrics = ctypes.windll.user32.GetSystemMetrics
+    return metrics(76), metrics(77), metrics(78), metrics(79)
+
+
+def grab(bbox):
+    """Screenshot in screen pixels, also on a monitor left of or above the main one."""
+    left, top, right, bottom = bbox
+    main_w = ctypes.windll.user32.GetSystemMetrics(0)
+    main_h = ctypes.windll.user32.GetSystemMetrics(1)
+    if left >= 0 and top >= 0 and right <= main_w and bottom <= main_h:
+        return ImageGrab.grab(bbox=bbox)
+    return ImageGrab.grab(bbox=bbox, all_screens=True)
 
 
 def load_solver():
@@ -401,15 +440,20 @@ def parse_board(
 
 def select_region() -> tuple[int, int, int, int] | None:
     root = tk.Tk()
-    root.attributes("-fullscreen", True)
+    # Cover every monitor, so the board can be boxed on either screen.
+    vx, vy, vw, vh = virtual_screen()
+    root.overrideredirect(True)
+    root.geometry(f"{vw}x{vh}+{vx}+{vy}")
     root.attributes("-topmost", True)
     root.attributes("-alpha", 0.25)
     root.configure(bg="black")
     canvas = tk.Canvas(root, bg="black", highlightthickness=0, cursor="cross")
     canvas.pack(fill="both", expand=True)
+    root.focus_force()
+    main_w = ctypes.windll.user32.GetSystemMetrics(0)
     canvas.create_text(
-        root.winfo_screenwidth() // 2,
-        40,
+        main_w // 2 - vx,
+        40 - vy,
         text="Kéo sát quanh các ô. Tool tự đếm lưới. Esc để hủy.",
         fill="white",
         font=("Segoe UI", 16),
@@ -487,7 +531,7 @@ def capture_ignores(window, canvas, region) -> bool:
     try:
         left = window.winfo_rootx()
         top = window.winfo_rooty()
-        shot = ImageGrab.grab(bbox=(left, top, left + size, top + size))
+        shot = grab((left, top, left + size, top + size))
         pixels = shot.load()
         for py in range(shot.height):
             for px in range(shot.width):
@@ -500,6 +544,30 @@ def capture_ignores(window, canvas, region) -> bool:
     finally:
         canvas.delete(probe)
         window.update()
+
+
+def satisfied_numbers(grids) -> list[int]:
+    """Open numbers whose flags already match, with a closed neighbor still to open.
+
+    Clicking that number is the chord: the game opens every remaining neighbor.
+    Only flags already visible on the board count, so a mine is never chorded
+    open before its flag exists.
+    """
+    targets = []
+    for cell in grids:
+        if not cell.flipped or cell.num <= 0:
+            continue
+        flags = 0
+        closed = False
+        for index in cell.adj_grids:
+            other = grids[index]
+            if other.flagged and not other.flipped:
+                flags += 1
+            elif not other.flipped:
+                closed = True
+        if closed and flags == cell.num:
+            targets.append(cell.index)
+    return targets
 
 
 def render(ai, mines: set[int] | None = None) -> str:
@@ -728,20 +796,83 @@ class Watcher:
         self.quiet = hide_from_capture(self.overlay) and capture_ignores(self.overlay, self.canvas, region)
         self.interval = 180 if self.quiet else 400
         self.last_marks: tuple | None = None
+        # Auto click starts off. The button or the T key turns it on and off.
+        self.auto = False
+        self.t_down = False
+        self.last_reading: tuple | None = None
+        self.changed_at = time.perf_counter()
+        self.acted_at = 0.0
+        self.acted_board: tuple | None = None
+        self.flag_tries: dict[int, int] = {}
+        if pyautogui is not None:
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = 0
         self.panel.attributes("-topmost", True)
-        self.panel.geometry("520x360+20+20")
+        self.panel.geometry(self._panel_geometry(520, 380))
         mode = "Overlay không chớp." if self.quiet else "Windows cũ: overlay phải ẩn khi đọc, sẽ hơi chớp."
-        self.status = tk.StringVar(value=f"Bạn chơi. Tool tô ô chắc sau mỗi nước. {mode}")
-        tk.Label(self.panel, textvariable=self.status, anchor="w", justify="left").pack(fill="x", padx=8, pady=(8, 0))
+        self.status = tk.StringVar(value=f"Tool tô ô chắc. Bấm nút hoặc phím T để bật tự động. {mode}")
+        self.auto_text = tk.StringVar()
+        tk.Label(self.panel, textvariable=self.auto_text, anchor="w", font=("Segoe UI", 10, "bold")).pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(self.panel, textvariable=self.status, anchor="w", justify="left", wraplength=500).pack(fill="x", padx=8)
         self.board = tk.Text(self.panel, height=16, width=62, font=("Consolas", 8), wrap="none")
         self.board.pack(fill="both", expand=True, padx=8, pady=8)
+        # Read only, so pressing T while the panel has focus does not type into it.
+        self.board.bind("<Key>", lambda _event: "break")
         buttons = tk.Frame(self.panel)
         buttons.pack(pady=(0, 8))
         tk.Button(buttons, text="Đọc lại lưới", command=self.reset_grid).pack(side="left", padx=4)
+        self.auto_button = tk.Button(buttons, command=self.toggle_auto, width=18)
+        self.auto_button.pack(side="left", padx=4)
         tk.Button(buttons, text="Dừng", command=self.stop).pack(side="left", padx=4)
+        self._show_auto_state()
         self.panel.protocol("WM_DELETE_WINDOW", self.stop)
         self.panel.bind("<Escape>", lambda _event: self.stop())
         self.panel.after(200, self.tick)
+        self.panel.after(40, self.poll_keys)
+
+    def _panel_geometry(self, panel_w: int, panel_h: int) -> str:
+        """Put the panel beside the board, so an auto click never lands on it."""
+        x, y, width, height = self.region
+        vx, vy, vw, vh = virtual_screen()
+        gap = 16
+        spots = (
+            (x + width + gap, y),
+            (x - panel_w - gap, y),
+            (x, y + height + gap + 40),
+            (x, y - panel_h - gap - 40),
+            (vx + 20, vy + 20),
+        )
+        for px, py in spots:
+            inside = vx <= px and vy <= py and px + panel_w <= vx + vw and py + panel_h + 40 <= vy + vh
+            overlap = px < x + width and x < px + panel_w and py < y + height and y < py + panel_h + 40
+            if inside and not overlap:
+                return f"{panel_w}x{panel_h}+{px}+{py}"
+        return f"{panel_w}x{panel_h}+{vx + 20}+{vy + 20}"
+
+    def _show_auto_state(self):
+        if self.auto:
+            self.auto_text.set("TỰ ĐỘNG: BẬT  (bấm T để tắt)")
+            self.auto_button.configure(text="Tắt tự động (T)")
+        else:
+            self.auto_text.set("TỰ ĐỘNG: TẮT  (bấm T để bật)")
+            self.auto_button.configure(text="Bật tự động (T)")
+
+    def poll_keys(self):
+        """Watch the T key everywhere, also while the browser has focus."""
+        if not self.running:
+            return
+        state = ctypes.windll.user32.GetAsyncKeyState
+        down = bool(state(0x54) & 0x8000)
+        # Ctrl, Alt and the Windows keys: Ctrl+T opens a browser tab, so skip it.
+        modifier = any(state(key) & 0x8000 for key in (0x11, 0x12, 0x5B, 0x5C))
+        if down and not self.t_down and not modifier:
+            self.toggle_auto()
+        self.t_down = down
+        self.panel.after(40, self.poll_keys)
+
+    def _t_pressed(self) -> bool:
+        """True when T is being pressed now, used to stop in the middle of a click run."""
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x54) & 0x8000)
 
     def reset_grid(self):
         self.x_borders = None
@@ -749,7 +880,20 @@ class Watcher:
         self.pending = None
         self.stable = None
         self.last_marks = None
+        self.last_reading = None
+        self.acted_board = None
+        self.flag_tries.clear()
         self.status.set("Đang tìm lại lưới ô")
+
+    def toggle_auto(self):
+        if pyautogui is None:
+            self.status.set("Chưa cài pyautogui. Chạy: pip install pyautogui")
+            return
+        self.auto = not self.auto
+        self.acted_board = None
+        self.acted_at = 0.0
+        self.flag_tries.clear()
+        self._show_auto_state()
 
     def stop(self):
         self.running = False
@@ -799,7 +943,7 @@ class Watcher:
             self.panel.update()
             time.sleep(0.04)
         x, y, width, height = self.region
-        image = ImageGrab.grab(bbox=(x, y, x + width, y + height))
+        image = grab((x, y, x + width, y + height))
         parsed = parse_board(image, self.x_borders, self.y_borders)
         if parsed is None:
             self.status.set("Chưa thấy lưới. Khoanh sát các ô, rồi bấm Đọc lại lưới.")
@@ -819,6 +963,10 @@ class Watcher:
             self.stable = None
             self.pending = None
         reading = tuple(cells)
+        confirmed = reading == self.pending
+        if reading != self.last_reading:
+            self.last_reading = reading
+            self.changed_at = time.perf_counter()
         if reading == self.pending:
             self.stable = reading
         else:
@@ -890,6 +1038,113 @@ class Watcher:
         if self.board.get("1.0", "end-1c") != picture:
             self.board.delete("1.0", "end")
             self.board.insert("end", picture)
+        self._auto_play(status, actions, confirmed, x_borders, y_borders, scale_x, scale_y, shown)
+
+    def _cell_point(self, index, x_borders, y_borders, scale_x, scale_y) -> tuple[int, int]:
+        cell = self.ai.grids[index]
+        center_x = (x_borders[cell.column] + 1 + x_borders[cell.column + 1]) / 2
+        center_y = (y_borders[cell.row] + 1 + y_borders[cell.row + 1]) / 2
+        origin_x, origin_y, _width, _height = self.region
+        return round(origin_x + center_x * scale_x), round(origin_y + center_y * scale_y)
+
+    def _park_mouse(self):
+        """Leave the cursor off the board so a hover highlight is not read as a cell."""
+        origin_x, origin_y, width, height = self.region
+        screen_w = self.panel.winfo_screenwidth()
+        screen_h = self.panel.winfo_screenheight()
+        vx, vy, vw, vh = virtual_screen()
+        candidates = (
+            (origin_x + width + 24, origin_y + 12),
+            (origin_x - 24, origin_y + 12),
+            (origin_x + 12, origin_y + height + 24),
+            (origin_x + 12, origin_y - 24),
+        )
+        for px, py in candidates:
+            on_board = origin_x <= px < origin_x + width and origin_y <= py < origin_y + height
+            on_screen = vx + 12 <= px <= vx + vw - 12 and vy + 12 <= py <= vy + vh - 12
+            if on_screen and not on_board:
+                pyautogui.moveTo(px, py)
+                return
+        pyautogui.moveTo(max(12, screen_w // 2), 12)
+
+    def _click_cell(self, index, button, x_borders, y_borders, scale_x, scale_y):
+        """Move, let the page see the hover, then press and release.
+
+        A browser game reads the cell under the pointer. Moving and clicking in
+        the same instant can hit the cell the pointer was on a moment earlier.
+        """
+        sx, sy = self._cell_point(index, x_borders, y_borders, scale_x, scale_y)
+        pyautogui.moveTo(sx, sy)
+        time.sleep(0.03)
+        pyautogui.mouseDown(sx, sy, button=button)
+        time.sleep(0.03)
+        pyautogui.mouseUp(sx, sy, button=button)
+        time.sleep(0.04)
+
+    def _auto_play(self, status, actions, confirmed, x_borders, y_borders, scale_x, scale_y, shown):
+        """One step per settled board, in this order:
+
+        1. click a number that already has enough flags, so the game opens the rest;
+        2. right-click the red cells to flag them;
+        3. left-click the green cells.
+
+        After each step the board is read again before the next step.
+        """
+        if not self.auto or not self.running or pyautogui is None or not confirmed or status in ("lose", "win"):
+            return
+        now = time.perf_counter()
+        # Wait until the board has stopped changing, so an opening or flag
+        # animation is not read as the real board.
+        if now - self.changed_at < 0.35 or now - self.acted_at < 0.5:
+            return
+        # The same board after a step means the step did nothing. Try again only
+        # after a longer pause.
+        if shown == self.acted_board and now - self.acted_at < 2.0:
+            return
+
+        grids = self.ai.grids
+        safe = {index for kind, index in actions if kind == "open"}
+        red = [index for kind, index in actions if kind == "flag"]
+        # Chord only when the solver agrees every hidden neighbor is safe. A
+        # misread flag then cannot make the game open a mine.
+        chords = []
+        for index in satisfied_numbers(grids):
+            hidden = [n for n in grids[index].adj_grids if not grids[n].flipped and not grids[n].flagged]
+            if hidden and all(n in safe for n in hidden):
+                chords.append(index)
+        # A right-click on a flag removes it, so each cell gets at most two tries.
+        flags = [index for index in red if self.flag_tries.get(index, 0) < 2]
+        opens = [index for index in sorted(safe) if not grids[index].flagged]
+
+        if chords:
+            step, button, cells = "Click số đã đủ cờ", "left", chords
+        elif flags:
+            step, button, cells = "Cắm cờ ô đỏ", "right", flags
+        elif opens:
+            step, button, cells = "Mở ô xanh", "left", opens
+        else:
+            return
+
+        self.acted_board = shown
+        done = 0
+        try:
+            for index in cells:
+                if not self.auto or self._t_pressed():
+                    break
+                if button == "right":
+                    self.flag_tries[index] = self.flag_tries.get(index, 0) + 1
+                self._click_cell(index, button, x_borders, y_borders, scale_x, scale_y)
+                done += 1
+        except pyautogui.FailSafeException:
+            self.auto = False
+            self._show_auto_state()
+            self.status.set("Đã dừng tự động: chuột chạm góc màn hình.")
+            return
+        finally:
+            self.acted_at = time.perf_counter()
+            if done:
+                self._park_mouse()
+        self.status.set(f"{step}: {done} ô.")
 
     def _draw_marks(self, actions, x_borders, y_borders, scale_x, scale_y, shift_x, shift_y):
         self.canvas.delete("all")
@@ -923,7 +1178,9 @@ def main():
     args = parser.parse_args()
     mines = args.mines
     print("Mở game bằng trình duyệt bình thường, rồi khoanh sát các ô.")
-    print("Bạn tự click. Sau mỗi nước, tool đọc lại bàn và chỉ ô chắc kế tiếp.")
+    print("Tự động tắt sẵn. Bấm nút 'Bật tự động (T)' hoặc phím T để bật/tắt.")
+    print("Khi bật: click số đã đủ cờ, cắm cờ ô đỏ, rồi mở ô xanh.")
+    print("Dừng khẩn cấp: bấm T, hoặc đưa chuột vào góc màn hình chính.")
     region = select_region()
     if region is None:
         print("Đã hủy.")
