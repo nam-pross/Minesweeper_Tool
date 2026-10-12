@@ -69,6 +69,43 @@ def virtual_screen() -> tuple[int, int, int, int]:
     return metrics(76), metrics(77), metrics(78), metrics(79)
 
 
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("mi", _MOUSEINPUT)]
+
+
+_MOVE_ABSOLUTE = 0x0001 | 0x4000 | 0x8000  # move, whole virtual desktop, absolute
+_BUTTON_FLAGS = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010)}
+
+
+def send_click(x: int, y: int, button: str) -> None:
+    """Move, press and release in one SendInput call.
+
+    The three events enter the input queue together and in order, so the page
+    always sees the pointer on the cell before the press, with no sleep between.
+    """
+    vx, vy, vw, vh = virtual_screen()
+    ax = round((x - vx) * 65535 / max(1, vw - 1))
+    ay = round((y - vy) * 65535 / max(1, vh - 1))
+    down, up = _BUTTON_FLAGS[button]
+    events = (_INPUT * 3)(
+        _INPUT(0, _MOUSEINPUT(ax, ay, 0, _MOVE_ABSOLUTE, 0, 0)),
+        _INPUT(0, _MOUSEINPUT(0, 0, 0, down, 0, 0)),
+        _INPUT(0, _MOUSEINPUT(0, 0, 0, up, 0, 0)),
+    )
+    ctypes.windll.user32.SendInput(3, events, ctypes.sizeof(_INPUT))
+
+
 def grab(bbox):
     """Screenshot in screen pixels, also on a monitor left of or above the main one."""
     left, top, right, bottom = bbox
@@ -798,6 +835,10 @@ class Watcher:
         self.last_marks: tuple | None = None
         # Auto click starts off. The button or the T key turns it on and off.
         self.auto = False
+        # Fast click only changes how auto clicks and how long it waits.
+        self.fast = tk.BooleanVar(master=self.panel, value=False)
+        # Open green cells only: no flags, no chord clicks, red cells stay untouched.
+        self.only_open = tk.BooleanVar(master=self.panel, value=False)
         self.t_down = False
         self.last_reading: tuple | None = None
         self.changed_at = time.perf_counter()
@@ -808,22 +849,28 @@ class Watcher:
             pyautogui.FAILSAFE = True
             pyautogui.PAUSE = 0
         self.panel.attributes("-topmost", True)
-        self.panel.geometry(self._panel_geometry(520, 380))
+        self.panel.geometry(self._panel_geometry(520, 420))
         mode = "Overlay không chớp." if self.quiet else "Windows cũ: overlay phải ẩn khi đọc, sẽ hơi chớp."
         self.status = tk.StringVar(value=f"Tool tô ô chắc. Bấm nút hoặc phím T để bật tự động. {mode}")
         self.auto_text = tk.StringVar()
         tk.Label(self.panel, textvariable=self.auto_text, anchor="w", font=("Segoe UI", 10, "bold")).pack(fill="x", padx=8, pady=(8, 0))
         tk.Label(self.panel, textvariable=self.status, anchor="w", justify="left", wraplength=500).pack(fill="x", padx=8)
-        self.board = tk.Text(self.panel, height=16, width=62, font=("Consolas", 8), wrap="none")
-        self.board.pack(fill="both", expand=True, padx=8, pady=8)
-        # Read only, so pressing T while the panel has focus does not type into it.
-        self.board.bind("<Key>", lambda _event: "break")
+        # The button rows are packed from the bottom before the board, so a small
+        # panel shrinks the board instead of cutting off the buttons.
+        options = tk.Frame(self.panel)
+        options.pack(side="bottom", pady=(0, 8))
+        tk.Checkbutton(options, text="Click nhanh", variable=self.fast, command=self._show_auto_state).pack(side="left", padx=4)
+        tk.Checkbutton(options, text="Chỉ mở ô xanh (không cắm cờ)", variable=self.only_open, command=self._show_auto_state).pack(side="left", padx=4)
         buttons = tk.Frame(self.panel)
-        buttons.pack(pady=(0, 8))
+        buttons.pack(side="bottom", pady=(0, 4))
         tk.Button(buttons, text="Đọc lại lưới", command=self.reset_grid).pack(side="left", padx=4)
         self.auto_button = tk.Button(buttons, command=self.toggle_auto, width=18)
         self.auto_button.pack(side="left", padx=4)
         tk.Button(buttons, text="Dừng", command=self.stop).pack(side="left", padx=4)
+        self.board = tk.Text(self.panel, height=16, width=62, font=("Consolas", 8), wrap="none")
+        self.board.pack(fill="both", expand=True, padx=8, pady=8)
+        # Read only, so pressing T while the panel has focus does not type into it.
+        self.board.bind("<Key>", lambda _event: "break")
         self._show_auto_state()
         self.panel.protocol("WM_DELETE_WINDOW", self.stop)
         self.panel.bind("<Escape>", lambda _event: self.stop())
@@ -850,11 +897,14 @@ class Watcher:
         return f"{panel_w}x{panel_h}+{vx + 20}+{vy + 20}"
 
     def _show_auto_state(self):
+        speed = "  |  CLICK NHANH" if self.fast.get() else ""
+        if self.only_open.get():
+            speed += "  |  CHỈ MỞ XANH"
         if self.auto:
-            self.auto_text.set("TỰ ĐỘNG: BẬT  (bấm T để tắt)")
+            self.auto_text.set(f"TỰ ĐỘNG: BẬT  (bấm T để tắt){speed}")
             self.auto_button.configure(text="Tắt tự động (T)")
         else:
-            self.auto_text.set("TỰ ĐỘNG: TẮT  (bấm T để bật)")
+            self.auto_text.set(f"TỰ ĐỘNG: TẮT  (bấm T để bật){speed}")
             self.auto_button.configure(text="Bật tự động (T)")
 
     def poll_keys(self):
@@ -910,7 +960,10 @@ class Watcher:
         except Exception as error:
             self.status.set(f"Lỗi đọc màn hình: {error}")
         if self.running:
-            self.panel.after(self.interval, self.tick)
+            # Read the board more often in fast mode, but only when the overlay
+            # does not have to blink for each reading.
+            interval = 90 if self.fast.get() and self.quiet else self.interval
+            self.panel.after(interval, self.tick)
 
     def _fit_model(self, rows: int, cols: int):
         if self.ai.grids and self.ai.Grid.rows == rows and self.ai.Grid.columns == cols:
@@ -1081,6 +1134,14 @@ class Watcher:
         pyautogui.mouseUp(sx, sy, button=button)
         time.sleep(0.04)
 
+    def _fast_click_cell(self, index, button, x_borders, y_borders, scale_x, scale_y):
+        """Move, press and release as one batch, then a short gap for the page."""
+        # SendInput skips pyautogui, so check the corner fail-safe here.
+        pyautogui.failSafeCheck()
+        sx, sy = self._cell_point(index, x_borders, y_borders, scale_x, scale_y)
+        send_click(sx, sy, button)
+        time.sleep(0.012)
+
     def _auto_play(self, status, actions, confirmed, x_borders, y_borders, scale_x, scale_y, shown):
         """One step per settled board, in this order:
 
@@ -1088,18 +1149,23 @@ class Watcher:
         2. right-click the red cells to flag them;
         3. left-click the green cells.
 
+        With "only open green" on, only step 3 runs.
+
         After each step the board is read again before the next step.
         """
         if not self.auto or not self.running or pyautogui is None or not confirmed or status in ("lose", "win"):
             return
         now = time.perf_counter()
+        fast = self.fast.get()
+        settle, gap, retry = (0.15, 0.2, 1.0) if fast else (0.35, 0.5, 2.0)
+        click = self._fast_click_cell if fast else self._click_cell
         # Wait until the board has stopped changing, so an opening or flag
         # animation is not read as the real board.
-        if now - self.changed_at < 0.35 or now - self.acted_at < 0.5:
+        if now - self.changed_at < settle or now - self.acted_at < gap:
             return
         # The same board after a step means the step did nothing. Try again only
         # after a longer pause.
-        if shown == self.acted_board and now - self.acted_at < 2.0:
+        if shown == self.acted_board and now - self.acted_at < retry:
             return
 
         grids = self.ai.grids
@@ -1116,7 +1182,11 @@ class Watcher:
         flags = [index for index in red if self.flag_tries.get(index, 0) < 2]
         opens = [index for index in sorted(safe) if not grids[index].flagged]
 
-        if chords:
+        if self.only_open.get():
+            if not opens:
+                return
+            step, button, cells = "Mở ô xanh", "left", opens
+        elif chords:
             step, button, cells = "Click số đã đủ cờ", "left", chords
         elif flags:
             step, button, cells = "Cắm cờ ô đỏ", "right", flags
@@ -1133,7 +1203,7 @@ class Watcher:
                     break
                 if button == "right":
                     self.flag_tries[index] = self.flag_tries.get(index, 0) + 1
-                self._click_cell(index, button, x_borders, y_borders, scale_x, scale_y)
+                click(index, button, x_borders, y_borders, scale_x, scale_y)
                 done += 1
         except pyautogui.FailSafeException:
             self.auto = False
