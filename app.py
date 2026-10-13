@@ -658,6 +658,207 @@ def _constraints(grids, mines: set[int], safe: set[int]) -> list[tuple[int, int,
     return out
 
 
+def _frontier_groups(cons: list[tuple[int, int, frozenset[int]]]) -> list[list[int]]:
+    """Closed cells linked by shared numbers. Each group can be solved on its own."""
+    by_cell: dict[int, list[int]] = {}
+    for k, (_index, _need, hidden) in enumerate(cons):
+        for cell in hidden:
+            by_cell.setdefault(cell, []).append(k)
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for cell in by_cell:
+        if cell in seen:
+            continue
+        stack = [cell]
+        group: list[int] = []
+        seen.add(cell)
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for j in by_cell[current]:
+                for other in cons[j][2]:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+        groups.append(group)
+    return groups
+
+
+def _overflagged(grids, mines: set[int]) -> bool:
+    """A number already has more flags than its value. The mine counter is then a lie."""
+    for cell in grids:
+        if not cell.flipped or cell.num <= 0:
+            continue
+        need = cell.num
+        for index in cell.adj_grids:
+            other = grids[index]
+            if not other.flipped and (other.flagged or index in mines):
+                need -= 1
+        if need < 0:
+            return True
+    return False
+
+
+def _mine_layouts(group: list[int], cons: list[tuple[int, int, frozenset[int]]], budget: int, deadline: float):
+    """Every mine bit-mask of one frontier group, or None if the search is cut short.
+
+    Bit i of a mask belongs to group cell `order[i]`. Masks that already use more
+    mines than the whole board has left are left out: they can never occur.
+    """
+    member = set(group)
+    local = [(need, hidden) for _index, need, hidden in cons if hidden & member]
+    if any(not hidden <= member for _need, hidden in local):
+        return None
+    touching = {cell: [k for k, (_need, hidden) in enumerate(local) if cell in hidden] for cell in group}
+    order = sorted(group, key=lambda cell: -len(touching[cell]))
+    placed = [0] * len(local)
+    left = [len(hidden) for _need, hidden in local]
+    found: list[int] = []
+    aborted = False
+
+    def search(pos: int, mask: int, used: int) -> None:
+        nonlocal aborted
+        if aborted:
+            return
+        if time.perf_counter() > deadline:
+            aborted = True
+            return
+        if pos == len(order):
+            found.append(mask)
+            if len(found) > 20000:
+                aborted = True
+            return
+        for value in (0, 1):
+            if used + value > budget:
+                continue
+            ok = True
+            for k in touching[order[pos]]:
+                placed[k] += value
+                left[k] -= 1
+                need = local[k][0]
+                if placed[k] > need or placed[k] + left[k] < need:
+                    ok = False
+            if ok:
+                bit = (1 << pos) if value else 0
+                search(pos + 1, mask | bit, used + value)
+            for k in touching[order[pos]]:
+                placed[k] -= value
+                left[k] += 1
+            if aborted:
+                return
+
+    search(0, 0, 0)
+    if aborted:
+        return None
+    return order, found
+
+
+def _apply_mine_budget(grids, cons, mines: set[int], safe: set[int], mine_total: int | None, mines_remaining: int | None, deadline: float) -> str:
+    """Use the mine counter, which is what actually decides small boards.
+
+    Two frontiers can each look legal and still be impossible together once the
+    number of mines left is known. Cells that survive every layout that adds up
+    to that number are certain. Returns "marked", "done", or "skip".
+    "done" means the counter was applied and there is nothing new to mark, so
+    the local enumeration cannot add a safe conclusion either.
+    """
+    if mine_total is None or mines_remaining is None or mine_total <= 0 or mine_total >= len(grids):
+        return "skip"
+    if _overflagged(grids, mines) or any(cell.flipped and cell.num < 0 for cell in grids):
+        return "skip"
+    budget = mines_remaining - len(mines)
+    unknown = [
+        index
+        for index, cell in enumerate(grids)
+        if not cell.flipped and not cell.flagged and index not in mines and index not in safe
+    ]
+    if budget < 0 or budget > len(unknown):
+        return "skip"
+    groups = _frontier_groups(cons)
+    if any(len(group) > TANK_LIMIT for group in groups):
+        return "skip"
+    frontier = {cell for group in groups for cell in group}
+    if any(cell not in unknown for cell in frontier):
+        return "skip"
+    interior = [cell for cell in unknown if cell not in frontier]
+    # No number touches the remaining cells. The counter alone places the mines.
+    if not groups:
+        changed = False
+        if budget == 0:
+            safe.update(interior)
+            changed = bool(interior)
+        elif budget == len(interior):
+            mines.update(interior)
+            changed = bool(interior)
+        return "marked" if changed else "done"
+
+    enumerated = []
+    for group in groups:
+        result = _mine_layouts(group, cons, budget, deadline)
+        if result is None or not result[1]:
+            return "skip"
+        enumerated.append(result)
+    counts = [{mask.bit_count() for mask in masks} for _order, masks in enumerated]
+    left_sums = [{0}]
+    for possible in counts:
+        reached = set()
+        for so_far in left_sums[-1]:
+            for count in possible:
+                if so_far + count <= budget:
+                    reached.add(so_far + count)
+        left_sums.append(reached)
+    right_sums = [{0} for _ in range(len(counts) + 1)]
+    for index in range(len(counts) - 1, -1, -1):
+        reached = set()
+        for so_far in right_sums[index + 1]:
+            for count in counts[index]:
+                if so_far + count <= budget:
+                    reached.add(so_far + count)
+        right_sums[index] = reached
+    interior_room = len(interior)
+    fitting = {total for total in left_sums[-1] if 0 <= budget - total <= interior_room}
+    if not fitting:
+        return "skip"
+
+    kept_groups = []
+    for index, (order, masks) in enumerate(enumerated):
+        kept = []
+        for mask in masks:
+            count = mask.bit_count()
+            for before in left_sums[index]:
+                if any(0 <= budget - before - count - after <= interior_room for after in right_sums[index + 1]):
+                    kept.append(mask)
+                    break
+        if not kept:
+            return "skip"
+        kept_groups.append((order, kept))
+
+    changed = False
+    for order, kept in kept_groups:
+        for bit, cell in enumerate(order):
+            probe = 1 << bit
+            always = all(mask & probe for mask in kept)
+            never = all(mask & probe == 0 for mask in kept)
+            if always and cell not in mines:
+                mines.add(cell)
+                changed = True
+            elif never and cell not in safe:
+                safe.add(cell)
+                changed = True
+    rest = {budget - total for total in fitting}
+    if rest == {0}:
+        for cell in interior:
+            if cell not in safe:
+                safe.add(cell)
+                changed = True
+    elif interior and rest == {len(interior)}:
+        for cell in interior:
+            if cell not in mines:
+                mines.add(cell)
+                changed = True
+    return "marked" if changed else "done"
+
+
 def _tank(groups: list[list[int]], cons: list[tuple[int, int, frozenset[int]]], mines: set[int], safe: set[int], deadline: float) -> bool:
     """Enumerate every mine layout of a small frontier. Cells with one answer are certain."""
     changed = False
@@ -718,6 +919,8 @@ def suggest(ai, known_mines: set[int] | None = None) -> tuple[str, list[tuple[st
 
     Mines found earlier are used like flags, so one mine unlocks the next, and
     the whole chain is marked in one pass instead of one number at a time.
+    On a small board the mine counter is part of the proof: a layout that fits
+    every number can still be impossible because it spends more mines than are left.
     """
     grids = ai.grids
     opened = [cell for cell in grids if cell.flipped]
@@ -734,6 +937,8 @@ def suggest(ai, known_mines: set[int] | None = None) -> tuple[str, list[tuple[st
     }
     safe: set[int] = set()
     deadline = time.perf_counter() + TANK_BUDGET
+    mine_total = getattr(ai.Grid, "mine_total", None)
+    mines_remaining = getattr(ai.Grid, "mines_remaining", None)
 
     while True:
         cons = _constraints(grids, mines, safe)
@@ -769,24 +974,14 @@ def suggest(ai, known_mines: set[int] | None = None) -> tuple[str, list[tuple[st
                     changed = True
         if changed:
             continue
-        # Rule 3: enumerate small frontier groups exhaustively.
-        groups: list[list[int]] = []
-        seen: set[int] = set()
-        for cell in by_cell:
-            if cell in seen:
-                continue
-            stack = [cell]
-            group = []
-            seen.add(cell)
-            while stack:
-                current = stack.pop()
-                group.append(current)
-                for j in by_cell[current]:
-                    for other in cons[j][2]:
-                        if other not in seen:
-                            seen.add(other)
-                            stack.append(other)
-            groups.append(group)
+        # Rule 3: the mine counter. This is what small boards are usually waiting on.
+        budget_state = _apply_mine_budget(grids, cons, mines, safe, mine_total, mines_remaining, deadline)
+        if budget_state == "marked":
+            continue
+        if budget_state == "done":
+            break
+        # Rule 4: no usable mine total. Enumerate each small frontier on its own.
+        groups = _frontier_groups(cons)
         groups.sort(key=len)
         if _tank(groups, cons, mines, safe, deadline):
             continue
@@ -1050,7 +1245,10 @@ class Watcher:
                 cell.flagged = False
                 cell.num = -1
         flagged = sum(cell.flagged for cell in self.ai.grids)
-        self.ai.Grid.mines_remaining = max(self.mine_total - flagged, 0)
+        # Negative means the board shows more flags than the difficulty allows.
+        # The solver then ignores the counter instead of opening the rest.
+        self.ai.Grid.mine_total = self.mine_total
+        self.ai.Grid.mines_remaining = self.mine_total - flagged
         self.ai.nums = [
             cell.index
             for cell in self.ai.grids
